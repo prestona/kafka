@@ -17,6 +17,8 @@
 
 package kafka.server
 
+import kafka.message.{MessageSet}
+import kafka.security.auth.{Operation, Authorizer}
 import org.apache.kafka.common.protocol.SecurityProtocol
 import org.apache.kafka.common.requests.{JoinGroupResponse, JoinGroupRequest, HeartbeatRequest, HeartbeatResponse, ResponseHeader}
 import org.apache.kafka.common.TopicPartition
@@ -45,7 +47,8 @@ class KafkaApis(val requestChannel: RequestChannel,
                 val zkClient: ZkClient,
                 val brokerId: Int,
                 val config: KafkaConfig,
-                val metadataCache: MetadataCache) extends Logging {
+                val metadataCache: MetadataCache,
+                val authorizer: Option[Authorizer]) extends Logging {
 
   this.logIdent = "[KafkaApi-%d] ".format(brokerId)
 
@@ -55,6 +58,7 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handle(request: RequestChannel.Request) {
     try{
       trace("Handling request: " + request.requestObj + " from client: " + request.remoteAddress)
+
       request.requestId match {
         case RequestKeys.ProduceKey => handleProducerRequest(request)
         case RequestKeys.FetchKey => handleFetchRequest(request)
@@ -96,6 +100,13 @@ class KafkaApis(val requestChannel: RequestChannel,
     // We can't have the ensureTopicExists check here since the controller sends it as an advisory to all brokers so they
     // stop serving data to clients for the topic being deleted
     val leaderAndIsrRequest = request.requestObj.asInstanceOf[LeaderAndIsrRequest]
+
+    if(authorizer.isDefined && !authorizer.get.authorize(request.session, Operation.SEND_CONTROL_MSG, null)) {
+      val leaderAndIsrResponse = new LeaderAndIsrResponse(leaderAndIsrRequest.correlationId, Map.empty, ErrorMapping.AuthorizationCode)
+      requestChannel.sendResponse(new Response(request, new BoundedByteBufferSend(leaderAndIsrResponse)))
+      return
+    }
+
     try {
       val (response, error) = replicaManager.becomeLeaderOrFollower(leaderAndIsrRequest, offsetManager)
       val leaderAndIsrResponse = new LeaderAndIsrResponse(leaderAndIsrRequest.correlationId, response, error)
@@ -112,6 +123,13 @@ class KafkaApis(val requestChannel: RequestChannel,
     // We can't have the ensureTopicExists check here since the controller sends it as an advisory to all brokers so they
     // stop serving data to clients for the topic being deleted
     val stopReplicaRequest = request.requestObj.asInstanceOf[StopReplicaRequest]
+
+    if(authorizer.isDefined && !authorizer.get.authorize(request.session, Operation.SEND_CONTROL_MSG, null)) {
+      val stopReplicaResponse = new StopReplicaResponse(stopReplicaRequest.correlationId, Map.empty, ErrorMapping.AuthorizationCode)
+      requestChannel.sendResponse(new Response(request, new BoundedByteBufferSend(stopReplicaResponse)))
+      return
+    }
+
     val (response, error) = replicaManager.stopReplicas(stopReplicaRequest)
     val stopReplicaResponse = new StopReplicaResponse(stopReplicaRequest.correlationId, response.toMap, error)
     requestChannel.sendResponse(new Response(request, new BoundedByteBufferSend(stopReplicaResponse)))
@@ -120,6 +138,18 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   def handleUpdateMetadataRequest(request: RequestChannel.Request) {
     val updateMetadataRequest = request.requestObj.asInstanceOf[UpdateMetadataRequest]
+
+    if(authorizer.isDefined) {
+      val unauthorizedTopicAndPartition = updateMetadataRequest.partitionStateInfos.filterKeys(
+        topicAndPartition => !authorizer.get.authorize(request.session, Operation.EDIT, topicAndPartition.topic)).keys
+      //In this case the response does not allow to selectively report success/failure so if authorization fails, we fail the entire request.
+      if (!unauthorizedTopicAndPartition.isEmpty) {
+        val updateMetadataResponse = new UpdateMetadataResponse(updateMetadataRequest.correlationId, ErrorMapping.AuthorizationCode)
+        requestChannel.sendResponse(new Response(request, new BoundedByteBufferSend(updateMetadataResponse)))
+        return
+      }
+    }
+
     replicaManager.maybeUpdateMetadataCache(updateMetadataRequest, metadataCache)
 
     val updateMetadataResponse = new UpdateMetadataResponse(updateMetadataRequest.correlationId)
@@ -131,6 +161,15 @@ class KafkaApis(val requestChannel: RequestChannel,
     // We can't have the ensureTopicExists check here since the controller sends it as an advisory to all brokers so they
     // stop serving data to clients for the topic being deleted
     val controlledShutdownRequest = request.requestObj.asInstanceOf[ControlledShutdownRequest]
+
+    if(authorizer.isDefined) {
+      if (!authorizer.get.authorize(request.session, Operation.SEND_CONTROL_MSG, null)) {
+        val controlledShutdownResponse = new ControlledShutdownResponse(controlledShutdownRequest.correlationId, ErrorMapping.AuthorizationCode,  Set.empty)
+        requestChannel.sendResponse(new Response(request, new BoundedByteBufferSend(controlledShutdownResponse)))
+        return
+      }
+    }
+
     val partitionsRemaining = controller.shutdownBroker(controlledShutdownRequest.brokerId)
     val controlledShutdownResponse = new ControlledShutdownResponse(controlledShutdownRequest.correlationId,
       ErrorMapping.NoError, partitionsRemaining)
@@ -144,9 +183,13 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleOffsetCommitRequest(request: RequestChannel.Request) {
     val offsetCommitRequest = request.requestObj.asInstanceOf[OffsetCommitRequest]
 
+    val (authorizedRequestInfo, unauthorizedRequestInfo) =  offsetCommitRequest.requestInfo.partition(
+      mapEntry => !authorizer.isDefined || authorizer.get.authorize(request.session, Operation.DESCRIBE, mapEntry._1.topic))
+
     // the callback for sending an offset commit response
     def sendResponseCallback(commitStatus: immutable.Map[TopicAndPartition, Short]) {
-      commitStatus.foreach { case (topicAndPartition, errorCode) =>
+      val mergedCommitStatus = commitStatus ++ unauthorizedRequestInfo.mapValues(_ => ErrorMapping.AuthorizationCode)
+      mergedCommitStatus.foreach { case (topicAndPartition, errorCode) =>
         // we only print warnings for known errors here; only replica manager could see an unknown
         // exception while trying to write the offset message to the local log, and it will log
         // an error message and write the error code in this case; hence it can be ignored here
@@ -157,7 +200,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
       }
 
-      val response = OffsetCommitResponse(commitStatus, offsetCommitRequest.correlationId)
+      val response = OffsetCommitResponse(mergedCommitStatus, offsetCommitRequest.correlationId)
       requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
     }
 
@@ -180,7 +223,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     val currentTimestamp = SystemTime.milliseconds
     val defaultExpireTimestamp = offsetRetention + currentTimestamp
 
-    val offsetData = offsetCommitRequest.requestInfo.mapValues(offsetAndMetadata =>
+    val offsetData = authorizedRequestInfo.mapValues(offsetAndMetadata =>
       offsetAndMetadata.copy(
         commitTimestamp = currentTimestamp,
         expireTimestamp = {
@@ -197,7 +240,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       offsetCommitRequest.groupId,
       offsetCommitRequest.consumerId,
       offsetCommitRequest.groupGenerationId,
-      offsetData,
+      offsetData, // TODO
       sendResponseCallback)
   }
 
@@ -207,10 +250,15 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleProducerRequest(request: RequestChannel.Request) {
     val produceRequest = request.requestObj.asInstanceOf[ProducerRequest]
 
+    val (authorizedRequestInfo, unauthorizedRequestInfo) =  produceRequest.data.partition(
+      mapEntry => !authorizer.isDefined || authorizer.get.authorize(request.session, Operation.WRITE, mapEntry._1.topic))
+
     // the callback for sending a produce response
     def sendResponseCallback(responseStatus: Map[TopicAndPartition, ProducerResponseStatus]) {
       var errorInResponse = false
-      responseStatus.foreach { case (topicAndPartition, status) =>
+      val mergedResponseStatus = responseStatus ++ unauthorizedRequestInfo.mapValues(_ => ProducerResponseStatus(ErrorMapping.AuthorizationCode, -1))
+
+      mergedResponseStatus.foreach { case (topicAndPartition, status) =>
         // we only print warnings for known errors here; if it is unknown, it will cause
         // an error message in the replica manager
         if (status.error != ErrorMapping.NoError && status.error != ErrorMapping.UnknownCode) {
@@ -233,7 +281,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           requestChannel.noOperation(request.processor, request)
         }
       } else {
-        val response = ProducerResponse(produceRequest.correlationId, responseStatus)
+        val response = ProducerResponse(produceRequest.correlationId, mergedResponseStatus)
         requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
       }
     }
@@ -247,7 +295,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       produceRequest.ackTimeoutMs.toLong,
       produceRequest.requiredAcks,
       internalTopicsAllowed,
-      produceRequest.data,
+      authorizedRequestInfo,
       sendResponseCallback)
 
     // if the request is put into the purgatory, it will have a held reference
@@ -262,9 +310,16 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleFetchRequest(request: RequestChannel.Request) {
     val fetchRequest = request.requestObj.asInstanceOf[FetchRequest]
 
+    val (authorizedRequestInfo, unauthorizedRequestInfo) =  fetchRequest.requestInfo.partition(
+      mapEntry => !authorizer.isDefined || authorizer.get.authorize(request.session, Operation.READ, mapEntry._1.topic))
+
+    val unauthorizedResponseStatus = unauthorizedRequestInfo.mapValues(_ => FetchResponsePartitionData(ErrorMapping.AuthorizationCode, -1, MessageSet.Empty))
+
     // the callback for sending a fetch response
     def sendResponseCallback(responsePartitionData: Map[TopicAndPartition, FetchResponsePartitionData]) {
-      responsePartitionData.foreach { case (topicAndPartition, data) =>
+      val mergedResponseStatus = responsePartitionData ++ unauthorizedResponseStatus
+
+      mergedResponseStatus.foreach { case (topicAndPartition, data) =>
         // we only print warnings for known errors here; if it is unknown, it will cause
         // an error message in the replica manager already and hence can be ignored here
         if (data.error != ErrorMapping.NoError && data.error != ErrorMapping.UnknownCode) {
@@ -278,7 +333,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         BrokerTopicStats.getBrokerAllTopicsStats().bytesOutRate.mark(data.messages.sizeInBytes)
       }
 
-      val response = FetchResponse(fetchRequest.correlationId, responsePartitionData)
+      val response = FetchResponse(fetchRequest.correlationId, mergedResponseStatus)
       requestChannel.sendResponse(new RequestChannel.Response(request, new FetchResponseSend(response)))
     }
 
@@ -287,7 +342,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       fetchRequest.maxWait.toLong,
       fetchRequest.replicaId,
       fetchRequest.minBytes,
-      fetchRequest.requestInfo,
+      authorizedRequestInfo,
       sendResponseCallback)
   }
 
@@ -296,7 +351,13 @@ class KafkaApis(val requestChannel: RequestChannel,
    */
   def handleOffsetRequest(request: RequestChannel.Request) {
     val offsetRequest = request.requestObj.asInstanceOf[OffsetRequest]
-    val responseMap = offsetRequest.requestInfo.map(elem => {
+
+    val (authorizedRequestInfo, unauthorizedRequestInfo) =  offsetRequest.requestInfo.partition(
+      mapEntry => !authorizer.isDefined || authorizer.get.authorize(request.session, Operation.READ, mapEntry._1.topic))
+
+    val unauthorizedResponseStatus = unauthorizedRequestInfo.mapValues(_ => PartitionOffsetsResponse(ErrorMapping.AuthorizationCode, Nil))
+
+    val responseMap = authorizedRequestInfo.map(elem => {
       val (topicAndPartition, partitionOffsetRequestInfo) = elem
       try {
         // ensure leader exists
@@ -336,7 +397,9 @@ class KafkaApis(val requestChannel: RequestChannel,
           (topicAndPartition, PartitionOffsetsResponse(ErrorMapping.codeFor(e.getClass.asInstanceOf[Class[Throwable]]), Nil) )
       }
     })
-    val response = OffsetResponse(offsetRequest.correlationId, responseMap)
+
+    val mergedResponseMap = responseMap ++ unauthorizedResponseStatus
+    val response = OffsetResponse(offsetRequest.correlationId, mergedResponseMap.toMap)
     requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
   }
 
@@ -436,10 +499,16 @@ class KafkaApis(val requestChannel: RequestChannel,
    */
   def handleTopicMetadataRequest(request: RequestChannel.Request) {
     val metadataRequest = request.requestObj.asInstanceOf[TopicMetadataRequest]
-    val topicMetadata = getTopicMetadata(metadataRequest.topics.toSet, request.securityProtocol)
+    val topics = metadataRequest.topics.toSet
+
+    val (authorizedTopics, unauthorizedTopics) =  topics.partition(topic => !authorizer.isDefined || authorizer.get.authorize(request.session, Operation.READ, topic))                                                                    
+
+    val unauthorizedTopicMetaData = unauthorizedTopics.map(topic => new TopicMetadata(topic, Seq.empty[PartitionMetadata], ErrorMapping.AuthorizationCode))
+
+    val topicMetadata = getTopicMetadata(authorizedTopics, request.securityProtocol)
     val brokers = metadataCache.getAliveBrokers
     trace("Sending topic metadata %s and brokers %s for correlation id %d to client %s".format(topicMetadata.mkString(","), brokers.mkString(","), metadataRequest.correlationId, metadataRequest.clientId))
-    val response = new TopicMetadataResponse(brokers.map(_.getBrokerEndPoint(request.securityProtocol)), topicMetadata, metadataRequest.correlationId)
+    val response = new TopicMetadataResponse(brokers.map(_.getBrokerEndPoint(request.securityProtocol)), topicMetadata ++ unauthorizedTopicMetaData, metadataRequest.correlationId)
     requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
   }
 
@@ -449,7 +518,14 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleOffsetFetchRequest(request: RequestChannel.Request) {
     val offsetFetchRequest = request.requestObj.asInstanceOf[OffsetFetchRequest]
 
-    val (unknownTopicPartitions, knownTopicPartitions) = offsetFetchRequest.requestInfo.partition(topicAndPartition =>
+    val (authorizedTopicPartitions, unauthorizedTopicPartitions) =  offsetFetchRequest.requestInfo.partition(
+      topicAndPartition => !authorizer.isDefined || authorizer.get.authorize(request.session, Operation.DESCRIBE, topicAndPartition.topic)
+    )
+
+    val authorizationError = OffsetMetadataAndError(OffsetMetadata.InvalidOffsetMetadata, ErrorMapping.AuthorizationCode)
+    val unauthorizedStatus = unauthorizedTopicPartitions.map(topicAndPartition => (topicAndPartition, authorizationError)).toMap
+
+    val (unknownTopicPartitions, knownTopicPartitions) = authorizedTopicPartitions.partition(topicAndPartition =>
       metadataCache.getPartitionInfo(topicAndPartition.topic, topicAndPartition.partition).isEmpty
     )
     val unknownStatus = unknownTopicPartitions.map(topicAndPartition => (topicAndPartition, OffsetMetadataAndError.UnknownTopicOrPartition)).toMap
@@ -458,7 +534,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         offsetManager.getOffsets(offsetFetchRequest.groupId, knownTopicPartitions).toMap
       else
         Map.empty[TopicAndPartition, OffsetMetadataAndError]
-    val status = unknownStatus ++ knownStatus
+    val status = unknownStatus ++ knownStatus ++ unauthorizedStatus
 
     val response = OffsetFetchResponse(status, offsetFetchRequest.correlationId)
 
@@ -474,6 +550,13 @@ class KafkaApis(val requestChannel: RequestChannel,
     val consumerMetadataRequest = request.requestObj.asInstanceOf[ConsumerMetadataRequest]
 
     val partition = offsetManager.partitionFor(consumerMetadataRequest.group)
+
+    //TODO: this can in turn create the topic, so we should check the create permissions if the config is enabled and topic is non existent.
+    if (authorizer.isDefined && !authorizer.get.authorize(request.session, Operation.DESCRIBE, OffsetManager.OffsetsTopicName)) {
+      val errorResponse = ConsumerMetadataResponse(None, ErrorMapping.ConsumerCoordinatorNotAvailableCode, consumerMetadataRequest.correlationId)
+      requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(errorResponse)))
+      return
+    }
 
     // get metadata (and create the topic if necessary)
     val offsetsTopicMetadata = getTopicMetadata(Set(OffsetManager.OffsetsTopicName), request.securityProtocol).head
@@ -496,12 +579,20 @@ class KafkaApis(val requestChannel: RequestChannel,
     import JavaConversions._
 
     val joinGroupRequest = request.body.asInstanceOf[JoinGroupRequest]
+
+    val (authorizedTopics, unauthorizedTopics) =  joinGroupRequest.topics().partition(
+      topic => (!authorizer.isDefined || authorizer.get.authorize(request.session, Operation.DESCRIBE, topic))
+    )
+
+    val unauthorizedTopicPartition = unauthorizedTopics.map(topic => new TopicPartition(topic, -1))
+
     val respHeader = new ResponseHeader(request.header.correlationId)
 
     // the callback for sending a join-group response
     def sendResponseCallback(partitions: List[TopicAndPartition], generationId: Int, errorCode: Short) {
-      val partitionList = partitions.map(tp => new TopicPartition(tp.topic, tp.partition)).toBuffer
-      val responseBody = new JoinGroupResponse(errorCode, generationId, joinGroupRequest.consumerId, partitionList)
+      val partitionList = (partitions.map(tp => new TopicPartition(tp.topic, tp.partition)) ++ unauthorizedTopicPartition).toBuffer
+      val error = if (errorCode == ErrorMapping.NoError && !unauthorizedTopicPartition.isEmpty) ErrorMapping.AuthorizationCode else errorCode
+      val responseBody = new JoinGroupResponse(error, generationId, joinGroupRequest.consumerId, partitionList)
       requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(respHeader, responseBody)))
     }
 
@@ -509,7 +600,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     coordinator.consumerJoinGroup(
       joinGroupRequest.groupId(),
       joinGroupRequest.consumerId(),
-      joinGroupRequest.topics().toList,
+      authorizedTopics.toList,
       joinGroupRequest.sessionTimeout(),
       joinGroupRequest.strategy(),
       sendResponseCallback)
@@ -518,6 +609,14 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleHeartbeatRequest(request: RequestChannel.Request) {
     val heartbeatRequest = request.body.asInstanceOf[HeartbeatRequest]
     val respHeader = new ResponseHeader(request.header.correlationId)
+
+    if (authorizer.isDefined && !authorizer.get.authorize(request.session, Operation.SEND_CONTROL_MSG, null)) {
+        val x = new HeartbeatResponse(ErrorMapping.AuthorizationCode)
+        requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(respHeader, x)))
+//        val heartbeatResponseAndHeader = new HeartbeatResponseAndHeader(heartbeatRequest.correlationId, new HeartbeatResponse(ErrorMapping.AuthorizationCode))
+//        requestChannel.sendResponse(new Response(request, new BoundedByteBufferSend(heartbeatResponseAndHeader)))
+        return
+    }
 
     // the callback for sending a heartbeat response
     def sendResponseCallback(errorCode: Short) {
